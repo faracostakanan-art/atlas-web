@@ -12,6 +12,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const API_URL = process.env.API_URL || 'https://felina-backend-production.up.railway.app';
 const WEBHOOK_URL = process.env.WEBHOOK_URL; // ex: https://atlas-bot.up.railway.app/webhook/nowpayments
 const IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET;
+const PAYMENT_WEBHOOK_SECRET = process.env.PAYMENT_WEBHOOK_SECRET; // doit matcher celui du backend Felina
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
 if (!BOT_TOKEN) {
@@ -63,7 +64,7 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
-  // Étape: l'utilisateur a déjà choisi la crypto et doit maintenant entrer le montant en EUR
+  // Étape: l'utilisateur a choisi la crypto et doit entrer le montant en EUR
   if (pendingRecharge[chatId] && pendingRecharge[chatId].step === 'awaiting_amount') {
     const cryptoChoice = pendingRecharge[chatId].crypto;
     const montantEur = parseFloat(msg.text.replace(',', '.'));
@@ -73,20 +74,42 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    // Création du paiement via NOWPayments (adresse unique par transaction)
-    const orderId = `USER_${userId}_${Date.now()}`;
-    await bot.sendMessage(chatId, '⏳ Génération de ton adresse de paiement...');
+    delete pendingRecharge[chatId];
+    await bot.sendMessage(chatId, '⏳ Création du dépôt...');
 
+    // 1) Créer un dépôt côté backend Felina → récupère une référence unique
+    let reference;
+    try {
+      const depRes = await axios.post(
+        `${API_URL}/api/deposits/create`,
+        {
+          user_id: String(userId),
+          amount: montantEur,
+          currency: 'EUR',
+          provider: 'nowpayments',
+        },
+        { timeout: 10000 }
+      );
+      reference = depRes.data.reference;
+    } catch (e) {
+      console.error('Erreur création dépôt Felina:', e.response?.data || e.message);
+      bot.sendMessage(
+        chatId,
+        '❌ Erreur lors de la création du dépôt. Réessaie plus tard ou contacte le support.',
+        { reply_markup: mainMenu }
+      );
+      return;
+    }
+
+    // 2) Créer le paiement NOWPayments avec cette référence comme order_id
     const payment = await createPayment({
       priceAmount: montantEur,
       priceCurrency: 'EUR',
       crypto: cryptoChoice,
-      orderId,
+      orderId: reference,
       orderDescription: `Recharge ATLAS - user ${userId}`,
       ipnCallbackUrl: WEBHOOK_URL,
     });
-
-    delete pendingRecharge[chatId];
 
     if (!payment.success) {
       bot.sendMessage(
@@ -109,7 +132,7 @@ bot.on('message', async (msg) => {
         `Envoie exactement :\n*${payment.pay_amount} ${payment.pay_currency.toUpperCase()}*\n\n` +
         `À l'adresse unique ci-dessous :\n\`${payment.pay_address}\`\n\n` +
         `💶 Montant crédité : *${payment.price_amount} ${payment.price_currency.toUpperCase()}*\n` +
-        `🆔 Payment ID : \`${payment.payment_id}\`\n` +
+        `🆔 Référence : \`${reference}\`\n` +
         `⏱ Expire le : ${expires}\n\n` +
         `⚠️ Cette adresse est *unique et temporaire*. Ta balance sera créditée automatiquement après confirmation de la transaction.${modeTag}`,
       { parse_mode: 'Markdown', reply_markup: mainMenu }
@@ -184,6 +207,19 @@ const app = express();
 app.use('/webhook/nowpayments', express.raw({ type: '*/*' }));
 app.use(express.json());
 
+function sortObjectDeep(obj) {
+  if (Array.isArray(obj)) return obj.map(sortObjectDeep);
+  if (obj && typeof obj === 'object') {
+    return Object.keys(obj)
+      .sort()
+      .reduce((acc, k) => {
+        acc[k] = sortObjectDeep(obj[k]);
+        return acc;
+      }, {});
+  }
+  return obj;
+}
+
 function verifyIpnSignature(rawBody, signatureHeader) {
   if (!IPN_SECRET) {
     console.error('⚠️ NOWPAYMENTS_IPN_SECRET non configuré');
@@ -191,7 +227,6 @@ function verifyIpnSignature(rawBody, signatureHeader) {
   }
   if (!signatureHeader) return false;
 
-  // NOWPayments signe le JSON avec clés triées alphabétiquement (récursivement)
   let parsed;
   try {
     parsed = JSON.parse(rawBody.toString('utf8'));
@@ -208,22 +243,6 @@ function verifyIpnSignature(rawBody, signatureHeader) {
     return false;
   }
 }
-
-function sortObjectDeep(obj) {
-  if (Array.isArray(obj)) return obj.map(sortObjectDeep);
-  if (obj && typeof obj === 'object') {
-    return Object.keys(obj)
-      .sort()
-      .reduce((acc, k) => {
-        acc[k] = sortObjectDeep(obj[k]);
-        return acc;
-      }, {});
-  }
-  return obj;
-}
-
-// Idempotence : garder en mémoire les payment_id déjà crédités (pour ce process)
-const processedPayments = new Set();
 
 app.post('/webhook/nowpayments', async (req, res) => {
   const signature = req.headers['x-nowpayments-sig'];
@@ -252,56 +271,62 @@ app.post('/webhook/nowpayments', async (req, res) => {
     order_id: payment.order_id,
   });
 
-  // On ne crédite que sur 'confirmed' / 'finished'
-  if (!['confirmed', 'finished'].includes(payment.payment_status)) return;
-
-  const idempotencyKey = `${payment.payment_id}`;
-  if (processedPayments.has(idempotencyKey)) {
-    console.log(`↩️ Paiement déjà traité: ${idempotencyKey}`);
-    return;
+  // Mapping vers le webhook du backend Felina
+  // status attendu: 'completed' | 'confirmed' → crédite ; autre → juste update
+  let felinaStatus;
+  switch (payment.payment_status) {
+    case 'finished':
+      felinaStatus = 'completed';
+      break;
+    case 'confirmed':
+      felinaStatus = 'confirmed';
+      break;
+    case 'partially_paid':
+      felinaStatus = 'underpaid';
+      break;
+    case 'failed':
+    case 'refunded':
+    case 'expired':
+      felinaStatus = 'failed';
+      break;
+    default:
+      felinaStatus = 'pending';
   }
-  processedPayments.add(idempotencyKey);
-
-  // Extraire le userId depuis order_id (USER_<id>_<timestamp>)
-  const match = (payment.order_id || '').match(/^USER_(\d+)_/);
-  if (!match) {
-    console.error('⚠️ order_id invalide, impossible de déterminer le user:', payment.order_id);
-    return;
-  }
-  const userId = match[1];
-  const amountEur = payment.price_amount; // Montant EUR défini lors de la création
 
   try {
     await axios.post(
-      `${API_URL}/api/user/${userId}/credit`,
+      `${API_URL}/api/payments/webhook`,
       {
-        amount: amountEur,
-        currency: payment.price_currency,
-        payment_id: payment.payment_id,
-        pay_currency: payment.pay_currency,
-        pay_amount: payment.pay_amount,
-        order_id: payment.order_id,
-        source: 'nowpayments',
+        reference: payment.order_id, // = la référence DEP-xxx créée en amont
+        transaction_id: String(payment.payment_id),
+        amount_received: payment.price_amount, // en EUR (doit matcher deposit.currency)
+        currency: (payment.price_currency || 'EUR').toUpperCase(),
+        status: felinaStatus,
+        provider: 'nowpayments',
+        metadata: {
+          pay_currency: payment.pay_currency,
+          pay_amount: payment.pay_amount,
+          pay_address: payment.pay_address,
+          actually_paid: payment.actually_paid,
+          nowpayments_status: payment.payment_status,
+        },
       },
-      { timeout: 10000 }
+      {
+        headers: { 'x-webhook-secret': PAYMENT_WEBHOOK_SECRET },
+        timeout: 10000,
+      }
     );
-    console.log(`💰 Balance créditée user ${userId}: +${amountEur} ${payment.price_currency}`);
+    console.log(`💰 Webhook Felina transmis pour ${payment.order_id} (${felinaStatus})`);
 
-    // Notifier l'utilisateur sur Telegram
-    try {
-      await bot.sendMessage(
-        parseInt(userId, 10),
-        `✅ Ta recharge de *${amountEur} ${String(payment.price_currency).toUpperCase()}* a été créditée avec succès !\n\n` +
-          `🆔 Payment ID : \`${payment.payment_id}\``,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) {
-      console.warn('Impossible de notifier user sur Telegram:', e.message);
+    // Notifier l'utilisateur sur Telegram quand paiement finalisé
+    if (felinaStatus === 'completed') {
+      // Extraire userId depuis reference DEP-xxx → pas possible directement, donc on fetch le deposit
+      // Solution simple: notifier sur base du metadata NOWPayments — pas de userId dans l'order_id.
+      // On va plutôt stocker user_id côté backend (déjà fait via /api/deposits/create) et laisser le bot ne pas notifier ici.
+      console.log(`✅ Paiement ${payment.order_id} finalisé`);
     }
   } catch (err) {
-    console.error(`❌ Échec crédit balance user ${userId}:`, err.response?.data || err.message);
-    // On retire de processedPayments pour permettre un retry sur le prochain IPN (NOWPayments en envoie plusieurs)
-    processedPayments.delete(idempotencyKey);
+    console.error(`❌ Échec transmission webhook Felina:`, err.response?.data || err.message);
   }
 });
 
@@ -312,6 +337,8 @@ app.get('/health', (_req, res) => {
     sandbox: IS_SANDBOX,
     webhook_url_configured: Boolean(WEBHOOK_URL),
     ipn_secret_configured: Boolean(IPN_SECRET),
+    payment_webhook_secret_configured: Boolean(PAYMENT_WEBHOOK_SECRET),
+    api_url: API_URL,
   });
 });
 
@@ -319,4 +346,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 ATLAS bot démarré (polling). Webhook Express sur le port ${PORT}`);
   console.log(`   Mode NOWPayments: ${IS_SANDBOX ? 'SANDBOX 🧪' : 'PRODUCTION'}`);
   console.log(`   WEBHOOK_URL: ${WEBHOOK_URL || '(non défini — à configurer)'}`);
+  console.log(`   API_URL: ${API_URL}`);
 });
