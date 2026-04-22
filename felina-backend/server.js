@@ -360,19 +360,7 @@ app.post("/api/orders/:userId/:orderId/refund", (req, res) => {
     const totalRefund = items.reduce((sum, i) => sum + Number(i.price), 0);
 
     const tx = db.transaction(() => {
-      for (const item of items) {
-        db.prepare(`
-          INSERT INTO products (title, subtitle, price, image_url, hidden_content, visible)
-          VALUES (?, ?, ?, ?, ?, 1)
-        `).run(
-          item.title,
-          item.subtitle || "",
-          Number(item.price),
-          item.image_url || "",
-          item.hidden_content || ""
-        );
-      }
-
+      // Crédite balance + incrémente compteur refunds
       db.prepare(`
         UPDATE users
         SET balance = balance + ?,
@@ -381,11 +369,9 @@ app.post("/api/orders/:userId/:orderId/refund", (req, res) => {
         WHERE id = ?
       `).run(totalRefund, getParisDate(), userId);
 
-      db.prepare(`
-        UPDATE orders
-        SET status = 'REFUNDED', refunded_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(order.id);
+      // Supprime définitivement : items + commande (plus d'historique, plus de produit remis en vente)
+      db.prepare("DELETE FROM order_items WHERE order_id = ?").run(order.id);
+      db.prepare("DELETE FROM orders WHERE id = ?").run(order.id);
     });
 
     tx();

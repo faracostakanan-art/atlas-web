@@ -5,6 +5,28 @@ const API = "https://felina-backend-production.up.railway.app/api";
 const MAX_REFUNDS_PER_DAY = 3;
 const REFUND_WINDOW_HOURS = 24;
 
+// Champs prédéfinis avec emojis
+const FIELD_DEFS = {
+  identifiant: { label: "Identifiant", emoji: "🆔" },
+  password: { label: "Mot de passe", emoji: "🔑" },
+  firstname: { label: "Prénom", emoji: "👤" },
+  lastname: { label: "Nom", emoji: "📛" },
+  birthday: { label: "Date de naissance", emoji: "🎂" },
+  phone: { label: "Téléphone", emoji: "☎️" },
+};
+
+// Parse hidden_content : si JSON avec fields -> structuré, sinon texte brut
+function parseContent(hiddenContent) {
+  if (!hiddenContent) return { mode: "empty", fields: [], raw: "" };
+  try {
+    const parsed = JSON.parse(hiddenContent);
+    if (parsed && parsed.mode === "structured" && Array.isArray(parsed.fields)) {
+      return { mode: "structured", fields: parsed.fields, raw: hiddenContent };
+    }
+  } catch (e) {}
+  return { mode: "raw", fields: [], raw: hiddenContent };
+}
+
 export default function App() {
   if (window.location.pathname === "/admin") {
     return <Admin />;
@@ -21,7 +43,7 @@ export default function App() {
   const [balance, setBalance] = useState(0);
   const [cart, setCart] = useState([]);
   const [refundsLeft, setRefundsLeft] = useState(MAX_REFUNDS_PER_DAY);
-  const [toast, setToast] = useState(null); // { text, type }
+  const [toast, setToast] = useState(null);
   const [refundingId, setRefundingId] = useState(null);
 
   const showToast = (text, type = "success") => {
@@ -35,9 +57,7 @@ export default function App() {
       const res = await fetch(`${API}/user/${USER_ID}`);
       const data = await res.json();
       if (res.ok) setBalance(Number(data.balance || 0));
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
   };
 
   const loadRefundStatus = async () => {
@@ -46,9 +66,7 @@ export default function App() {
       const res = await fetch(`${API}/user/${USER_ID}/refund-status`);
       const data = await res.json();
       if (res.ok) setRefundsLeft(Number(data.refunds_left ?? MAX_REFUNDS_PER_DAY));
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
   };
 
   const loadProducts = async () => {
@@ -56,10 +74,7 @@ export default function App() {
       const res = await fetch(`${API}/products`);
       const data = await res.json();
       setProducts(res.ok && Array.isArray(data) ? data : []);
-    } catch (e) {
-      console.error(e);
-      setProducts([]);
-    }
+    } catch (e) { setProducts([]); }
   };
 
   const loadOrders = async () => {
@@ -68,10 +83,7 @@ export default function App() {
       const res = await fetch(`${API}/orders/${USER_ID}`);
       const data = await res.json();
       setOrders(res.ok && Array.isArray(data) ? data : []);
-    } catch (e) {
-      console.error(e);
-      setOrders([]);
-    }
+    } catch (e) { setOrders([]); }
   };
 
   useEffect(() => {
@@ -114,9 +126,7 @@ export default function App() {
         const data = await res.json();
         if (!res.ok || !data.success) {
           showToast(data.error || `Erreur achat ${item.title}`, "error");
-          await loadUser();
-          await loadProducts();
-          await loadOrders();
+          await loadUser(); await loadProducts(); await loadOrders();
           return;
         }
         setBalance(Number(data.balance));
@@ -127,7 +137,6 @@ export default function App() {
       setPage("orders");
       showToast("Achat effectué avec succès");
     } catch (e) {
-      console.error(e);
       showToast("Erreur lors du paiement", "error");
     }
   };
@@ -139,7 +148,6 @@ export default function App() {
       if (res.ok) setSelectedOrder(data);
       else showToast(data.error || "Commande introuvable", "error");
     } catch (e) {
-      console.error(e);
       showToast("Erreur chargement commande", "error");
     }
   };
@@ -157,7 +165,7 @@ export default function App() {
     if (!order) return;
     const confirmed = window.confirm(
       `Rembourser cette commande ?\n\n` +
-      `Ton solde sera recrédité et le produit redeviendra disponible.\n\n` +
+      `Ton solde sera recrédité et la commande sera SUPPRIMÉE de ton historique.\n\n` +
       `Remboursements restants aujourd'hui : ${refundsLeft}/${MAX_REFUNDS_PER_DAY}`
     );
     if (!confirmed) return;
@@ -176,13 +184,10 @@ export default function App() {
       setBalance(Number(data.new_balance));
       setRefundsLeft(Number(data.refunds_left ?? refundsLeft - 1));
       showToast(`Remboursement de ${Number(data.refunded_amount).toFixed(2)}€ effectué`);
+      setSelectedOrder(null);
       await loadOrders();
       await loadProducts();
-      // Rafraîchir la commande ouverte
-      const refreshed = await fetch(`${API}/orders/${USER_ID}/${order.id}`).then((r) => r.json());
-      setSelectedOrder(refreshed);
     } catch (e) {
-      console.error(e);
       showToast("Erreur réseau", "error");
     } finally {
       setRefundingId(null);
@@ -193,6 +198,39 @@ export default function App() {
     if (status === "REFUNDED") return "refunded";
     if (status === "COMPLETED") return "done";
     return "waiting";
+  };
+
+  const renderFields = (content) => {
+    const parsed = parseContent(content);
+    if (parsed.mode === "structured" && parsed.fields.length > 0) {
+      return (
+        <div className="field-list">
+          {parsed.fields.map((f, i) => {
+            const def = FIELD_DEFS[f.key] || {};
+            const emoji = f.emoji || def.emoji || "•";
+            const label = f.label || def.label || f.key;
+            return (
+              <div className="field-row" key={i}>
+                <div className="field-emoji">{emoji}</div>
+                <div className="field-body">
+                  <div className="field-label">{label}</div>
+                  <div className="field-value">{f.value || "-"}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+    if (parsed.mode === "raw" && parsed.raw) {
+      return (
+        <div className="order-detail-raw-box">
+          <div className="order-detail-raw-label">Contenu livré</div>
+          <pre className="order-detail-raw-text">{parsed.raw}</pre>
+        </div>
+      );
+    }
+    return null;
   };
 
   return (
@@ -216,7 +254,7 @@ export default function App() {
             <div className="balance-label">SOLDE DISPONIBLE</div>
             <div className="balance-amount">€{balance.toFixed(2)}</div>
             <div className="refund-chip" data-testid="refund-chip">
-              🔄 {refundsLeft}/{MAX_REFUNDS_PER_DAY} remboursements restants aujourd'hui
+              🔄 {refundsLeft}/{MAX_REFUNDS_PER_DAY} remboursements restants
             </div>
           </div>
 
@@ -227,32 +265,24 @@ export default function App() {
 
           <div className="page-container">
             {products.map((product) => (
-              <div className="order-card" key={product.id} data-testid={`product-card-${product.id}`}>
-                {product.image_url ? (
-                  <img
-                    src={product.image_url}
-                    alt={product.title}
-                    style={{
-                      width: "100%",
-                      borderRadius: "14px",
-                      marginBottom: "12px",
-                      display: "block",
-                      objectFit: "cover",
-                      maxHeight: "150px",
-                    }}
-                  />
-                ) : null}
-
-                <div className="order-top">
-                  <div>
-                    <div className="order-title">{product.title}</div>
-                    <div className="order-date">{product.subtitle}</div>
+              <div className="shop-product" key={product.id} data-testid={`product-card-${product.id}`}>
+                <div className="shop-product-top">
+                  {product.image_url ? (
+                    <img className="shop-product-thumb" src={product.image_url} alt={product.title} />
+                  ) : (
+                    <div className="shop-product-thumb empty">📦</div>
+                  )}
+                  <div className="shop-product-info">
+                    <div className="shop-product-title">{product.title}</div>
+                    {product.subtitle ? (
+                      <div className="shop-product-subtitle">{product.subtitle}</div>
+                    ) : null}
+                    <div className="shop-product-status">DISPONIBLE</div>
                   </div>
-                  <div className="status-badge waiting">DISPONIBLE</div>
                 </div>
 
                 <button
-                  className="details-btn"
+                  className="shop-product-cta"
                   onClick={() => addToCart(product)}
                   data-testid={`add-to-cart-${product.id}`}
                 >
@@ -273,32 +303,20 @@ export default function App() {
           ) : (
             <>
               {cart.map((item) => (
-                <div className="order-card" key={item.id}>
-                  {item.image_url ? (
-                    <img
-                      src={item.image_url}
-                      alt={item.title}
-                      style={{
-                        width: "100%",
-                        borderRadius: "14px",
-                        marginBottom: "12px",
-                        display: "block",
-                        objectFit: "cover",
-                        maxHeight: "150px",
-                      }}
-                    />
-                  ) : null}
-
-                  <div className="order-top">
-                    <div>
-                      <div className="order-title">{item.title}</div>
-                      <div className="order-date">{item.subtitle}</div>
+                <div className="shop-product" key={item.id}>
+                  <div className="shop-product-top">
+                    {item.image_url ? (
+                      <img className="shop-product-thumb" src={item.image_url} alt={item.title} />
+                    ) : (
+                      <div className="shop-product-thumb empty">📦</div>
+                    )}
+                    <div className="shop-product-info">
+                      <div className="shop-product-title">{item.title}</div>
+                      {item.subtitle ? (
+                        <div className="shop-product-subtitle">{item.subtitle}</div>
+                      ) : null}
+                      <div className="shop-product-status">PANIER · €{Number(item.price).toFixed(2)}</div>
                     </div>
-                    <div className="status-badge waiting">PANIER</div>
-                  </div>
-
-                  <div style={{ marginTop: "16px", fontSize: "20px", fontWeight: 800, color: "#c4b5fd" }}>
-                    €{Number(item.price).toFixed(2)}
                   </div>
 
                   <button
@@ -311,14 +329,15 @@ export default function App() {
                 </div>
               ))}
 
-              <div className="order-card">
-                <div className="order-title" style={{ fontSize: "22px" }}>Total panier</div>
-                <div className="order-date">{cart.length} produit(s)</div>
-                <div style={{ marginTop: "14px", fontSize: "28px", fontWeight: 800, color: "#c4b5fd" }}>
-                  €{cartTotal.toFixed(2)}
+              <div className="shop-product">
+                <div className="shop-product-top">
+                  <div className="shop-product-info">
+                    <div className="shop-product-title">Total panier</div>
+                    <div className="shop-product-subtitle">{cart.length} produit(s)</div>
+                    <div className="shop-product-status">€{cartTotal.toFixed(2)}</div>
+                  </div>
                 </div>
-
-                <button className="details-btn" onClick={checkoutCart} data-testid="checkout-btn">
+                <button className="shop-product-cta" onClick={checkoutCart} data-testid="checkout-btn">
                   Payer avec le solde
                 </button>
               </div>
@@ -343,71 +362,27 @@ export default function App() {
                 </div>
               </div>
 
-              {(selectedOrder.items || []).map((item) => {
-                let parsed = null;
-                try {
-                  parsed = JSON.parse(item.hidden_content || "{}");
-                } catch (e) {
-                  parsed = null;
-                }
-                const detailTitle = parsed?.title || item.title;
-                const detailPrice = parsed?.monthly_price || `€${Number(item.price).toFixed(2)}`;
-                const detailBadges = Array.isArray(parsed?.badges) ? parsed.badges : [];
-                const detailFields = Array.isArray(parsed?.fields) ? parsed.fields : [];
-
-                return (
-                  <div key={item.id} style={{ marginTop: "18px" }}>
+              {(selectedOrder.items || []).map((item) => (
+                <div key={item.id} className="order-detail-product">
+                  <div className="order-detail-product-top">
                     {item.image_url ? (
-                      <img
-                        src={item.image_url}
-                        alt={detailTitle}
-                        style={{
-                          width: "100%",
-                          borderRadius: "18px",
-                          marginBottom: "16px",
-                          display: "block",
-                          objectFit: "cover",
-                          maxHeight: "170px",
-                        }}
-                      />
-                    ) : null}
-
-                    <div className="product-mini-card">
-                      <div className="product-mini-header">
-                        <div className="product-mini-header-left">
-                          <div className="product-mini-title">{detailTitle}</div>
-                          {detailBadges.length > 0 && (
-                            <div className="product-mini-badges">
-                              {detailBadges.map((b, i) => (
-                                <div className="product-mini-badge" key={i}>{b}</div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                        <div className="product-mini-price">{detailPrice}</div>
-                      </div>
-
-                      {detailFields.length > 0 ? (
-                        <div className="product-mini-grid">
-                          {detailFields.map((f, i) => (
-                            <div className="product-mini-row" key={i}>
-                              <div className="product-mini-label">{f?.label || "Champ"}</div>
-                              <div className="product-mini-value">{f?.value || "-"}</div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="order-detail-content-box">
-                          <div className="order-detail-content-label">Contenu livré</div>
-                          <pre className="order-detail-content-text">{item.hidden_content}</pre>
-                        </div>
-                      )}
+                      <img className="order-detail-product-img" src={item.image_url} alt={item.title} />
+                    ) : (
+                      <div className="order-detail-product-img" style={{ display: "flex", alignItems: "center", justifyContent: "center", fontSize: "22px", color: "#5d4f85" }}>📦</div>
+                    )}
+                    <div className="order-detail-product-info">
+                      <div className="order-detail-product-title">{item.title}</div>
+                      {item.subtitle ? (
+                        <div className="shop-product-subtitle">{item.subtitle}</div>
+                      ) : null}
+                      <div className="order-detail-product-price">€{Number(item.price).toFixed(2)}</div>
                     </div>
                   </div>
-                );
-              })}
 
-              {/* Bouton Remboursement */}
+                  {renderFields(item.hidden_content)}
+                </div>
+              ))}
+
               {isRefundable(selectedOrder) ? (
                 <button
                   className="refund-btn"
@@ -422,11 +397,11 @@ export default function App() {
                       : `Rembourser cette commande (${refundsLeft}/${MAX_REFUNDS_PER_DAY} restants)`}
                 </button>
               ) : selectedOrder.status === "REFUNDED" ? (
-                <div style={{ marginTop: "12px", textAlign: "center", color: "#fca5a5", fontSize: "13px", fontWeight: 600 }}>
-                  Déjà remboursée{selectedOrder.refunded_at ? ` le ${selectedOrder.refunded_at}` : ""}
+                <div style={{ marginTop: "10px", textAlign: "center", color: "#fca5a5", fontSize: "12px", fontWeight: 600 }}>
+                  Déjà remboursée
                 </div>
               ) : (
-                <div style={{ marginTop: "12px", textAlign: "center", color: "#9d8fc7", fontSize: "13px" }}>
+                <div style={{ marginTop: "10px", textAlign: "center", color: "#9d8fc7", fontSize: "12px" }}>
                   Délai de remboursement dépassé (24h max)
                 </div>
               )}
